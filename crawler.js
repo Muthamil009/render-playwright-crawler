@@ -1,145 +1,169 @@
 // crawler.js
-const { chromium } = require('playwright');
-const fs = require('fs').promises;
+import fs from 'fs';
+import path from 'path';
+import { chromium } from 'playwright';
+import PQueue from 'p-queue';
+import { createObjectCsvWriter as createCsvWriter } from 'csv-writer';
 
-// Configuration options
-const CONFIG = {
-  maxDepth: 2,
-  concurrency: 3,
-  ignoreAssets: true,
-  outputFormat: 'json', // 'json' or 'csv'
-  assetExtensions: ['.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.svg', '.ico']
-};
+let browser = null;
+let initPromise = null;
 
-async function shouldIgnoreUrl(url) {
-  if (!CONFIG.ignoreAssets) return false;
-  try {
-    const pathname = new URL(url).pathname.toLowerCase();
-    return CONFIG.assetExtensions.some(ext => pathname.endsWith(ext));
-  } catch (e) {
-    return false;
+/**
+ * Initialize single browser instance (idempotent)
+ */
+export async function initBrowser() {
+  if (initPromise) return initPromise;
+  initPromise = (async () => {
+    // Launch browser with sandbox flags for container environments
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    console.log('Browser launched');
+    return browser;
+  })();
+  return initPromise;
+}
+
+/**
+ * Shutdown browser gracefully
+ */
+export async function shutdownBrowser() {
+  if (browser) {
+    try {
+      await browser.close();
+      browser = null;
+      console.log('Browser closed');
+    } catch (err) {
+      console.error('Error closing browser:', err);
+    }
   }
 }
 
-async function crawl(urls, browser, visited = new Set(), depth = CONFIG.maxDepth) {
-  if (depth < 0) return [];
-  
-  // Filter out already visited URLs
-  const newUrls = urls.filter(url => !visited.has(url));
-  if (newUrls.length === 0) return [];
+/**
+ * Simple static asset filter
+ */
+function isStaticAsset(url) {
+  if (!url) return false;
+  const staticExt = /\.(jpg|jpeg|png|gif|svg|ico|webp|css|js|woff|woff2|ttf|eot|map)(\?.*)?$/i;
+  return staticExt.test(new URL(url, 'http://example.com').pathname);
+}
 
-  // Process URLs in chunks based on concurrency
-  const chunks = [];
-  for (let i = 0; i < newUrls.length; i += CONFIG.concurrency) {
-    chunks.push(newUrls.slice(i, i + CONFIG.concurrency));
+/**
+ * Crawl a URL limited by depth and concurrency.
+ * Returns an object { pages: [{url, title, status}], apiEndpoints: [] } etc.
+ */
+export async function crawl(startUrl, opts = {}) {
+  await initBrowser();
+  const concurrency = Math.max(1, opts.concurrency || 5);
+  const maxDepth = Math.max(1, opts.depth || 2);
+  const filterStatic = opts.filterStatic ?? true;
+  const limitToSameOrigin = opts.sameOrigin ?? true;
+
+  const queue = new PQueue({ concurrency });
+  const visited = new Set();
+  const results = [];
+  const apiEndpoints = new Set();
+
+  // Normalize origin for same-origin filtering
+  let startOrigin;
+  try {
+    startOrigin = new URL(startUrl).origin;
+  } catch (err) {
+    throw new Error('Invalid startUrl');
   }
 
-  const results = [];
-  for (const chunk of chunks) {
-    const promises = chunk.map(async url => {
-      visited.add(url);
-      const page = await browser.newPage();
-      const endpoints = new Set();
-      const origin = new URL(url).origin;
+  // BFS-like function that enqueues link crawling tasks
+  async function enqueue(url, depth) {
+    if (visited.has(url)) return;
+    visited.add(url);
+    await queue.add(() => processPage(url, depth));
+  }
 
-      page.on('request', request => {
-        const reqUrl = request.url();
-        if (!reqUrl.startsWith('data:') && 
-            reqUrl.startsWith(origin) && 
-            !shouldIgnoreUrl(reqUrl)) {
-          endpoints.add(reqUrl);
+  async function processPage(url, depth) {
+    // optional filter static extensions quickly
+    if (filterStatic && isStaticAsset(url)) {
+      return;
+    }
+    if (limitToSameOrigin && new URL(url).origin !== startOrigin) {
+      // skip external origins
+      return;
+    }
+
+    const context = await browser.newContext(); // isolates cookies/storage
+    const page = await context.newPage();
+    try {
+      // intercept responses to record API-like responses
+      page.on('response', async (response) => {
+        const rUrl = response.url();
+        // crude check for JSON content or xhr/fetch
+        const ct = response.headers()['content-type'] || '';
+        if (ct.includes('application/json') || rUrl.match(/\/api\/|api=|graphql/gi)) {
+          apiEndpoints.add(rUrl);
         }
       });
 
-      try {
-        await page.goto(url, { waitUntil: 'domcontentloaded' });
+      const resp = await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 }).catch(e => null);
+      const status = resp ? resp.status() : null;
+      const title = await page.title().catch(() => '');
 
-        const forms = await page.$$eval('form', forms => forms.map(f => ({
-          action: f.action,
-          fields: Array.from(f.querySelectorAll('input, textarea, select')).map(i => ({
-            name: i.name || '(no name)',
-            type: i.type || i.tagName.toLowerCase()
-          }))
-        })));
+      results.push({ url, title, status, depth });
 
-        const links = await page.$$eval('a', anchors =>
-          anchors.map(a => a.href).filter(href => href && href.startsWith(origin))
-        );
-
-        await page.close();
-
-        // Recursively crawl found links
-        const subResults = await crawl(links, browser, visited, depth - 1);
-        
-        return [{
-          pageUrl: url,
-          forms,
-          apiEndpoints: Array.from(endpoints)
-        }, ...subResults];
-
-      } catch (e) {
-        await page.close();
-        return [];
+      if (depth < maxDepth) {
+        // collect links on page
+        const hrefs = await page.$$eval('a[href]', (els) => els.map(a => a.href).filter(Boolean));
+        for (const h of hrefs) {
+          try {
+            // Normalize anchor-only links
+            const absolute = new URL(h, url).toString();
+            if (filterStatic && isStaticAsset(absolute)) continue;
+            if (!visited.has(absolute)) {
+              // enqueue next depth
+              await enqueue(absolute, depth + 1);
+            }
+          } catch (err) {
+            // ignore malformed URLs
+          }
+        }
       }
-    });
-
-    const chunkResults = await Promise.all(promises);
-    results.push(...chunkResults.flat());
-  }
-
-  return results;
-}
-
-async function outputResults(data, format) {
-  if (format === 'csv') {
-    let csv = 'Page URL,Form Action,Form Fields,API Endpoints\n';
-    data.forEach(page => {
-      const forms = page.forms.map(f => 
-        `${f.action}(${f.fields.map(field => `${field.name}:${field.type}`).join(';')})`
-      ).join('|');
-      csv += `"${page.pageUrl}","${forms}","${page.apiEndpoints.join('|')}"\n`;
-    });
-    await fs.writeFile('crawler-output.csv', csv);
-    return 'crawler-output.csv';
-  } else {
-    await fs.writeFile('crawler-output.json', JSON.stringify(data, null, 2));
-    return 'crawler-output.json';
-  }
-}
-
-async function main() {
-  const startUrl = process.argv[2];
-  if (!startUrl) {
-    console.error("Usage: node crawler.js <URL> [options]");
-    process.exit(1);
-  }
-
-  // Parse command line options
-  process.argv.slice(3).forEach(arg => {
-    const [key, value] = arg.split('=');
-    switch(key) {
-      case '--depth': CONFIG.maxDepth = parseInt(value); break;
-      case '--concurrency': CONFIG.concurrency = parseInt(value); break;
-      case '--ignore-assets': CONFIG.ignoreAssets = value === 'true'; break;
-      case '--format': CONFIG.outputFormat = value; break;
+    } catch (err) {
+      console.error('Error processing', url, err?.message || err);
+    } finally {
+      await page.close().catch(()=>{});
+      await context.close().catch(()=>{});
     }
-  });
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  });
-
-  try {
-    const data = await crawl([startUrl], browser, new Set());
-    const outputFile = await outputResults(data, CONFIG.outputFormat);
-    console.log(`Crawl complete! Results saved to ${outputFile}`);
-    await browser.close();
-  } catch (e) {
-    console.error('Crawl failed:', e);
-    await browser.close();
-    process.exit(1);
   }
+
+  // start
+  await enqueue(startUrl, 1);
+  // wait for all tasks
+  await queue.onIdle();
+
+  return {
+    pages: results,
+    apiEndpoints: Array.from(apiEndpoints),
+    visitedCount: visited.size,
+  };
 }
 
-main();
+/**
+ * Utility: write results to CSV and return file path
+ */
+export async function writeCsv(results, filenamePrefix='crawl') {
+  const timestamp = Date.now();
+  const filename = `${filenamePrefix}-${timestamp}.csv`;
+  const filepath = path.resolve('/tmp', filename);
+
+  const csvWriter = createCsvWriter({
+    path: filepath,
+    header: [
+      { id: 'url', title: 'URL' },
+      { id: 'title', title: 'Title' },
+      { id: 'status', title: 'Status' },
+      { id: 'depth', title: 'Depth' },
+    ],
+  });
+
+  await csvWriter.writeRecords(results.pages || []);
+  return filepath;
+}

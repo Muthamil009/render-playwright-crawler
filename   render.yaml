@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: crawler-service
+    env: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
