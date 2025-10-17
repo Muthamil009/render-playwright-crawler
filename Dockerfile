@@ -8,7 +8,7 @@ WORKDIR /usr/src/app
 COPY package.json package-lock.json* ./
 
 # Install deps
-RUN npm ci --unsafe-perm
+RUN npm install --unsafe-perm
 
 # Copy rest
 COPY . .
